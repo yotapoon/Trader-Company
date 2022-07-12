@@ -1,0 +1,330 @@
+---
+title: "clean_data"
+author: "Yota"
+date: "2022/3/19"
+output: html_document
+---
+
+`{<style type="text/css">} .main-container {max-width: 1500px;} </style>`
+
+# セットアップ
+
+## ライブラリの読み込み
+
+```{r}
+library(pacman)
+pacman::p_load(readxl, dplyr, tidyverse, patchwork, openxlsx)
+```
+
+## データの読み込み
+
+suumoからダウンロードした`data_suumo_test.xlsx`を読み込む
+
+```{r}
+agg = read_excel("../data/data_from_suumo.xlsx")
+```
+
+## データ構造の確認
+
+```{r}
+agg %>% str()
+```
+
+# データクレンジング
+列ごとにデータを整形する
+## カテゴリー
+おそらく表記ゆれはないため，特に整形は必要なし．
+対象は「賃貸アパート」または「賃貸マンション」に限る.
+※「賃貸テラス・タウンハウス」と「賃貸一戸建て」は対象から除く
+```{r}
+agg %>% group_by(カテゴリー) %>% summarize(n = n())
+agg %>% filter(カテゴリー %in% c("賃貸アパート", "賃貸マンション")) -> agg
+```
+
+
+## アドレス
+念のため，半角を全角に変換する処理を用いる．
+```{r}
+# まずはどのようなデータがあるのか確認
+agg %>% select(アドレス) %>% group_by(アドレス) %>% summarize(n = n())
+
+# 半角を全角に変換する関数
+zenkaku = c("０","１","２","３","４","５","６","７","８","９")
+hankaku = c("0","1","2","3","4","5","6","7","8","9")
+
+han_to_zen = function(data){ # dataはベクトル
+  for(i in 1:length(hankaku)){
+    data = gsub(hankaku[i], zenkaku[i], data)
+  }
+  return(data)
+}
+
+agg = agg %>% mutate(アドレス = han_to_zen(アドレス))
+agg %>% mutate(アドレス_new = str_extract(アドレス, "東京都.+区")) %>% 
+  mutate(アドレス = str_sub(アドレス_new, 4, -1)) -> agg
+
+agg %>% group_by(アドレス) %>% summarize(n = n()) %>% arrange(desc(n))
+```
+
+
+## アクセス
+最寄り駅と，最寄り駅までの交通手段，最寄り駅までの時間(分)に分ける．
+```{r}
+# 半角で区切る関数
+split_by_space = function(data, col_to_extract){ # データはベクトル，何列目を取り出すかも指定できる
+  data_splitted = str_split(data, " ", simplify = T, n = 2)
+  return(data_splitted[, col_to_extract])
+}
+
+# アクセスの情報を適切に分割．バスまでの徒歩時間は無視する．
+agg = agg %>%
+  mutate(最寄り駅 = split_by_space(アクセス, 1)) %>% 
+  mutate(交通手段_所要時間 = split_by_space(アクセス, 2)) %>% 
+  mutate(最寄駅への交通手段 = str_extract(交通手段_所要時間, "[^0-9]+")) %>% 
+  mutate(最寄駅への所要時間 = as.numeric(str_extract(交通手段_所要時間, "[0-9]+")))
+
+# 交通手段ごとの件数を確認
+agg %>% group_by(最寄駅への交通手段) %>% summarize(n = n()) %>% arrange(desc(n))
+
+# 徒歩のデータに限って，所要時間を確認
+agg_only_walk = agg %>% filter(最寄駅への交通手段 == "歩")
+ggplot(agg_only_walk, aes(x = 最寄駅への所要時間)) + 
+  geom_histogram() +
+ggplot(agg_only_walk,  aes(x = 最寄駅への所要時間)) + 
+  geom_histogram() +
+  scale_x_log10()
+```
+
+## 築年数
+年数のみを取り出し，数値データにする．
+```{r}
+agg %>% select(築年数) %>% group_by(築年数) %>% summarize(n = n())
+agg = agg %>% mutate(築年数 = as.numeric(str_extract(築年数, "[0-9]+")))
+ggplot(agg, aes(x = 築年数)) + 
+  geom_histogram() +
+ggplot(agg,  aes(x = 築年数)) + 
+  geom_histogram() +
+  scale_x_log10()
+```
+
+## 構造
+```{r}
+# 地上と地下を分ける関数
+split_by_land = function(data, col_to_extract){ # データはベクトル，何列目を取り出すかも指定できる
+  data_splitted = str_split(data, "地上", simplify = T, n = 2)
+  return(data_splitted[, col_to_extract])
+}
+
+# 2階建 -> (2階建, NA)
+# 地下1地上5階建 -> (地下1, 5階建)
+agg %>%
+  mutate(first_elem = split_by_land(構造, 1)) %>% 
+  mutate(second_elem = split_by_land(構造, 2)) %>% 
+  mutate(second_elem = na_if(second_elem, "")) %>% # ここがややこしい
+  mutate(地上 = if_else(is.na(second_elem), first_elem, second_elem)) %>% 
+  mutate(地下 = if_else(is.na(second_elem), second_elem, first_elem)) %>% 
+  mutate(地上 = as.numeric(str_extract(地上, "[0-9]+"))) %>% 
+  mutate(地下 = as.numeric(str_extract(地下, "[0-9]+"))) %>% 
+  select(-c(first_elem, second_elem)) -> agg
+agg %>% select(構造, 地上, 地下)
+```
+
+## 階数
+階数が地下であったり，二階にわたるような場合は削除する(意外とあるけど面倒なので)
+```{r}
+agg %>% select(階数) %>% group_by(階数) %>% summarize(n = n())
+agg %>% filter(str_detect(階数, "B")) %>% select(階数) # 地下
+agg %>% filter(str_detect(階数, "[0-9]+-[0-9]+")) %>% select(階数) # 階数が二階にわたる
+
+agg %>%
+  filter(!str_detect(階数, "B")) %>%
+  filter(!str_detect(階数, "[0-9]+-[0-9]+")) %>%
+  mutate(階数 = as.numeric(str_extract(階数, "[0-9]+"))) -> agg
+
+ggplot(agg, aes(x = 階数)) + 
+  geom_histogram() +
+ggplot(agg,  aes(x = 階数)) + 
+  geom_histogram() +
+  scale_x_log10()
+```
+
+## 家賃
+単位を万円に変換し，`NA`は適当に置換する
+```{r}
+agg %>% 
+  mutate(家賃 = na_if(家賃, "-")) %>% 
+  mutate(家賃_new = if_else(str_detect(家賃, '\\.'),
+                          str_extract(家賃, "[0-9]+\\.[0-9]+"),
+                          str_extract(家賃, "[0-9]+"))) %>% 
+  mutate(家賃 = as.numeric(家賃_new)) -> agg
+ggplot(agg, aes(x = 家賃)) + 
+  geom_histogram() +
+ggplot(agg,  aes(x = 家賃)) + 
+  geom_histogram() +
+  scale_x_log10()
+```
+
+## 管理費
+単位を万円に変換し，`NA`は適当に置換する
+
+```{r}
+agg %>% select(管理費) %>% group_by(管理費) %>% summarize(n = n())
+agg %>% 
+  mutate(管理費 = na_if(管理費, "-")) %>% 
+  mutate(管理費 = as.numeric(str_extract(管理費, "[0-9]+")) / 10000.0) -> agg
+ggplot(agg, aes(x = 管理費)) + 
+  geom_histogram()
+```
+
+## 敷金
+```{r}
+agg %>% select(敷金) %>% group_by(敷金) %>% summarize(n = n())
+agg %>% 
+  mutate(敷金 = na_if(敷金, "-")) %>% 
+  mutate(敷金_new = if_else(str_detect(敷金, '\\.'),
+                          str_extract(敷金, "[0-9]+\\.[0-9]+"),
+                          str_extract(敷金, "[0-9]+"))) %>% 
+  mutate(敷金 = as.numeric(敷金_new)) -> agg
+```
+
+## 礼金
+```{r}
+agg %>% select(礼金) %>% group_by(礼金) %>% summarize(n = n())
+agg %>% 
+  mutate(礼金 = na_if(礼金, "-")) %>% 
+  mutate(礼金_new = if_else(str_detect(礼金, '\\.'),
+                          str_extract(礼金, "[0-9]+\\.[0-9]+"),
+                          str_extract(礼金, "[0-9]+"))) %>% 
+  mutate(礼金 = as.numeric(礼金_new)) -> agg
+```
+
+## 間取り
+S：サービスルームがあるか，R：部屋の数，LDK：キッチンの広さ，に分解する
+```{r}
+agg %>% select(間取り) %>% group_by(間取り) %>% summarize(n = n())
+agg %>%
+  mutate(S = str_detect(間取り, "S")) %>% 
+  mutate(R = str_extract(間取り, "[0-9]+")) %>% 
+  mutate(R = as.numeric(if_else(str_detect(間取り, "ワンルーム"), "1", R))) %>% 
+  mutate(LDK = if_else(str_detect(間取り, "LDK"), "3", 
+         if_else(str_detect(間取り, "DK"), "2",
+         if_else(str_detect(間取り, "K"), "1","")))) %>% 
+  mutate(LDK= as.numeric(na_if(LDK, ""))) -> agg
+ggplot(agg, aes(x = R)) + 
+  geom_histogram()
+```
+
+## 面積
+```{r}
+agg %>% select(面積) %>% group_by(面積) %>% summarize(n = n())
+agg %>% mutate(面積 = if_else(str_detect(面積, '\\.'),
+                          str_extract(面積, "[0-9]+\\.[0-9]+"),
+                          str_extract(面積, "[0-9]+"))) %>% 
+  mutate(面積 = as.numeric(面積)) -> agg
+
+ggplot(agg, aes(x = 面積)) + 
+  geom_histogram() +
+ggplot(agg,  aes(x = 面積)) + 
+  geom_histogram() +
+  scale_x_log10()
+```
+# メモ
+実現したい処理
+①パーセンタイルの処理，個数，平均値
+カテゴリごとに，
+ある連続変数で
+
+```{r}
+address_levels = agg$アドレス %>% unique()
+address_levels
+
+```
+
+
+```{r}
+
+
+# グループごとに，指定したパーセンタイル値を集約する
+## col_value：集約される値を表す列
+## col_group：グループ分けに利用される列
+## probs：パーセンタイルを指定する0以上1以下の数値のベクトル
+## levels：col_groupの値の順番を指定するリスト
+summarize_by_quantiles = function(df, col_value, col_group = NULL, probs = NULL,
+                                  levels = NULL, sort_desc = FALSE){
+  
+  # パーセンタイルの指定がない場合，適当に指定する
+  if (is.null(probs)){
+    probs = c(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+  }
+  q_probs = scales::percent(probs) # x%のような表記にしたベクトル
+  
+  # dplyr的な取り扱いをするための謎の処理
+  col_value = substitute(col_value)
+  col_group = substitute(col_group)
+  quantile_to_sort = substitute(quantile_to_sort)
+  
+  # 値が入っていない行はそもそも除く(できれば欠損の個数も知りたい，時間があれば修正)
+  df %>% filter(!is.na(.data[[col_value]])) -> df
+  
+  # グループ分けが必要なら分けておく(なくてもOK)
+  if (!is.null(col_group)){
+    df %>% group_by(.data[[col_group]]) -> df
+  }
+  
+  # グループごとに，指定したパーセンタイル値を
+  df %>% # いい感じに集約
+    summarize(n = n(), mean = mean(.data[[col_value]]), median = median(.data[[col_value]]),
+              quentiles = quantile(.data[[col_value]], probs = probs),
+              q = q_probs, .groups = "keep") %>% 
+    pivot_wider(names_from = "q", values_from = quentiles) -> df
+  
+  # ソートの準備
+  if(!is.null(col_group) & !is.null(levels)){
+    # グループ分けがあり，col_groupの順番も指定されているとき
+    df %>% mutate(col_to_sort = factor(.data[[col_group]], levels = levels)) -> df
+  }else{ # そうでない場合は中央値で分ける
+    df %>% mutate(col_to_sort = median) -> df
+  }
+  
+  # 降順か昇順でソート
+  if(sort_desc){
+    df %>% arrange(desc(col_to_sort)) -> df
+  }else{
+    df %>% arrange(col_to_sort) -> df
+  }
+  # 不要な列は落として出力  
+  df %>% select(-col_to_sort, -median) %>% return()
+}
+
+probs = c(0.1, 0.25, 0.5, 0.75, 0.9)
+agg %>% 
+  summarize_by_quantiles(col_value = 家賃, col_group = アドレス, probs = probs, 
+                         levels = address_levels, sort_desc = TRUE)
+  #summarize_by_quantiles(家賃, probs = probs)
+
+
+```
+```{r}
+check_value = function(data_focus, col){
+  data_focus %>% 
+    group_by(.data[[col]]) %>% 
+    summarize(n = n()) %>% 
+    arrange(desc(n)) %>% 
+    return()
+}
+```
+
+
+
+```{r}
+data %>% 
+  group_by(アドレス) %>% 
+  summarize(n = n(), mean = mean(家賃), 
+            quantiles = quantile(家賃, probs = probs),
+            q = q_probs, .groups = "keep") %>% 
+  pivot_wider(names_from = "q", values_from = quantiles) %>% 
+  arrange(med) -> data_address_vs_rent
+```
+
+
+
